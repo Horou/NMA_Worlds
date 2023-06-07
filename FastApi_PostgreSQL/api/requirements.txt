@@ -1,0 +1,5 @@
+fastapi>=0.88
+sqlalchemy>=1.4
+Alembic>=1.8
+asyncpg>=0.27
+uvicorn>=0.20

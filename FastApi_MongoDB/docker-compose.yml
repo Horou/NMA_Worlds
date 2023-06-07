@@ -1,0 +1,66 @@
+version: "3.9"
+
+services:
+
+  web:
+    image: horou/nma-web:1.0
+    container_name: NMA_WEB
+    build:
+      context: web
+    ports:
+      - "80:${API_PORT}"
+      - "8080:8080"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    depends_on:
+      - api
+    networks:
+      - proxy
+
+  api:
+    image: horou/nma-api:1.0
+    container_name: NMA_API
+    build: api
+    ports:
+      - "${API_PORT}"
+    env_file:
+      - .env
+    environment:
+      DB_URL: ${DB_TYPE}://${DB_USERNAME}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}${DB_OPTION}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.fastapi.rule=Host(`localhost`)"
+    volumes:
+      - ../media:${FILES_PATH}
+    depends_on:
+      - db
+    networks:
+      - proxy
+
+  db:
+    image: horou/nma-db:1.0
+    container_name: NMA_DB
+    build: db
+    environment:
+      MONGO_INITDB_DATABASE: ${DB_NAME}
+      MONGO_INITDB_ROOT_USERNAME: ${DB_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db_data:/data/db
+    networks:
+      - proxy
+
+  scraper:
+    image: horou/nma-scraper:1.0
+    container_name: NMA_SCRAPER
+    build: scraper
+    ports:
+      - "4444:4444"
+    networks:
+      - proxy
+
+volumes:
+  db_data:
+
+networks:
+  proxy:

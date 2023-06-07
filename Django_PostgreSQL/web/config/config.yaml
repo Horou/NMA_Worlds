@@ -1,0 +1,18 @@
+http:
+  routers:
+    web:
+      rule: "Host(`admin.docker.localhost`)"
+      service: "api@internal"
+      tls:
+        domains:
+          - main: "docker.localhost"
+            sans:
+              - "*.docker.localhost"
+          - main: "domain.local"
+            sans:
+              - "*.domain.local"
+
+tls:
+  certificates:
+    - certFile: "/certificates/domain-cert.pem"
+      keyFile: "/certificates/domain-key.pem"
