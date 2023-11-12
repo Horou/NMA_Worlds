@@ -1,6 +1,7 @@
 import json
 from collections import OrderedDict
 
+from django.db.transaction import atomic
 from rest_framework import serializers
 from rest_framework.utils import model_meta
 from rest_framework.utils.field_mapping import (get_nested_relation_kwargs,)
@@ -82,6 +83,76 @@ class OneToManyClassField(serializers.ManyRelatedField):
 
 
 class DeepSerializer(serializers.ModelSerializer):
+    _serializers = {}
+    _mode = ""
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if hasattr(cls, "Meta"):
+            cls._serializers[cls._mode + cls.Meta.model.__name__] = cls
+            cls._nested_relations = {}
+            for field_name, field in model_meta.get_field_info(cls.Meta.model).relations.items():
+                cls._nested_relations[field_name] = field
+            for field_name, field in model_meta.get_field_info(cls.Meta.model).reverse_relations.items():
+                cls._nested_relations[field_name] = field
+
+    def deep_create(self, data):
+        result_pk, representation = "", {}
+        try:
+            with atomic():
+                result_pk, representation = self._deep_create(data, self.Meta.model)
+                if "ERROR" in representation:
+                    raise Exception(representation["ERROR"])
+        except:
+            pass
+        return result_pk, representation
+
+    def _deep_create(self, data, model):
+        try:
+            instance = model.objects.get(pk=data[model._meta.pk.name])
+        except:
+            instance = None
+        return self.get_nested_serializer(model)(
+            instance, data=data, context=self.context, partial=True if instance else False
+        )._create_child(data)
+
+    def _create_child(self, validated_data):
+        representation = {}
+        for field_name, field_relation in self._nested_relations.items():
+            data = validated_data.get(field_name, None)
+            if isinstance(data, dict):
+                validated_data[field_name], representation[field_name] = self._deep_create(
+                    data, field_relation.related_model
+                )
+            elif isinstance(data, list):
+                representation[field_name] = list(data)
+                for index, item in enumerate(data):
+                    if isinstance(item, dict):
+                        validated_data[field_name][index], representation[field_name][index] = self._deep_create(
+                            item, field_relation.related_model
+                        )
+        self.initial_data = validated_data
+        if self.is_valid():
+            return self.save().pk, dict(self.data, **representation)
+        representation["ERROR"] = self.errors
+        return "Fail to serialize %s" % self.Meta.model.__name__, representation
+
+    @classmethod
+    def get_nested_serializer(cls, _model):
+        if "Nested" + _model.__name__ not in cls._serializers:
+
+            class NestedSerializer(DeepSerializer):
+                _mode = "Nested"
+
+                class Meta:
+                    model = _model
+                    depth = 0
+                    fields = '__all__'
+
+        return cls._serializers["Nested" + _model.__name__]
+
+
+class DeepSerializer_old(serializers.ModelSerializer):
     type = serializers.SerializerMethodField()
     _serializers = {}
     _models = {}
