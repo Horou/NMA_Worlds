@@ -70,7 +70,6 @@ class DeepSerializer(serializers.ModelSerializer):
     def build_nested_field(self, field_name, relation_info, nested_depth):
         serializer = self.get_serializer(relation_info.related_model, mode=f"Read{self.Meta.model.__name__}Nested")
         serializer.parent_prefetch = self.get_parent_prefetch(field_name)
-        print(f"serializer for model: {relation_info.related_model}, have now prefetch: {serializer.parent_prefetch}")
         serializer.Meta.depth = nested_depth - 1
         return serializer, get_nested_relation_kwargs(relation_info)
 
