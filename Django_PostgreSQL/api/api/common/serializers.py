@@ -19,41 +19,15 @@ class DeepSerializer(serializers.ModelSerializer):
         super().__init_subclass__(**kwargs)
         if hasattr(cls, "Meta"):
             model = cls.Meta.model
-            cls._exclude_models = [model]
-            cls._exclude_models_for_prefetch = [model]
             cls._serializers[cls._mode + model.__name__] = cls
-            cls._all_fields = {}
-            cls._nested_models = {}
-            cls._select_related = []
-            for field_name, field in model_meta.get_field_info(model).fields.items():
-                cls._all_fields[field_name] = field
-            for field_name, field in model_meta.get_field_info(model).relations.items():
-                if not field_name.endswith("_set"):
-                    cls._all_fields[field_name] = field
-                    cls._nested_models[field_name] = field.related_model
-                    cls._select_related.append(field_name)
-            for field_name, field in model_meta.get_field_info(model).reverse_relations.items():
-                cls._all_fields[field_name] = field
-                cls._nested_models[field_name] = field.related_model
-                cls._select_related.append(field_name)
-            cls._prefetch_related = [related[2:] for related in cls.build_prefetch_related(model, cls._exclude_models)]
-
-    def __init__(self, *args, **kwargs):
-        self.exclude_models = self._exclude_models
-        self._exclude_models = [self.Meta.model]
-        super().__init__(*args, **kwargs)
-
-    def get_default_field_names(self, declared_fields, model_info):
-        return [model_info.pk.name] + list(self._all_fields) + list(declared_fields)
-
-    def build_nested_field(self, field_name, relation_info, nested_depth):
-        serializer = self.get_serializer(relation_info.related_model, mode=f"Read{self.Meta.model.__name__}Nested")
-        serializer._exclude_models += self.exclude_models
-        if exclude_names := tuple(k for k, v in serializer._nested_models.items() if v in self.exclude_models):
-            serializer.Meta.fields = None
-            serializer.Meta.exclude = exclude_names
-        serializer.Meta.depth = nested_depth - 1
-        return serializer, get_nested_relation_kwargs(relation_info)
+            cls._nested_models = {
+                field_name: field.related_model
+                for field_name, field in model_meta.get_field_info(model).relations.items()
+                if not field_name.endswith("_set")
+            }
+            cls.Meta.read_only_fields = tuple(model_meta.get_field_info(model).reverse_relations)
+            cls._prefetch_related = [related[2:] for related in cls.build_prefetch_related(model, [model])]
+            cls.parent_prefetch = cls.parent_prefetch if hasattr(cls, 'parent_prefetch') else cls._prefetch_related
 
     @classmethod
     def build_prefetch_related(cls, parent_model, exclude_models):
@@ -70,10 +44,35 @@ class DeepSerializer(serializers.ModelSerializer):
     @classmethod
     def get_prefetch_related(cls):
         return [
-            related
-            for related in cls._prefetch_related
-            if 0 < len(re.findall('__', related)) < cls.Meta.depth
+            prefetch_related
+            for prefetch_related in cls._prefetch_related
+            if len(re.findall('__', prefetch_related)) < cls.Meta.depth
         ]
+
+    @classmethod
+    def get_parent_prefetch(cls, field_name):
+        parent_prefetch = []
+        for prefetch in cls.parent_prefetch:
+            child_prefetch = prefetch.split('__')
+            if child_prefetch[0] == field_name and 0 < len(child_prefetch) - 1 <= cls.Meta.depth:
+                parent_prefetch.append("__".join(child_prefetch[1:]))
+        return parent_prefetch
+
+    def get_nested_fields(self):
+        return [
+            field.split('__')[0]
+            for field in self.parent_prefetch
+        ]
+
+    def get_default_field_names(self, declared_fields, model_info):
+        return super().get_default_field_names(declared_fields, model_info) + self.get_nested_fields()
+
+    def build_nested_field(self, field_name, relation_info, nested_depth):
+        serializer = self.get_serializer(relation_info.related_model, mode=f"Read{self.Meta.model.__name__}Nested")
+        serializer.parent_prefetch = self.get_parent_prefetch(field_name)
+        print(f"serializer for model: {relation_info.related_model}, have now prefetch: {serializer.parent_prefetch}")
+        serializer.Meta.depth = nested_depth - 1
+        return serializer, get_nested_relation_kwargs(relation_info)
 
     def deep_list_create(self, data):
         return [self.deep_create(item)[1] for item in data]
@@ -104,14 +103,14 @@ class DeepSerializer(serializers.ModelSerializer):
         for field_name, field_model in self._nested_models.items():
             data = validated_data.get(field_name, None)
             if isinstance(data, dict):
-                validated_data[field_name], representation[field_name] = self._deep_create(
+                validated_data[field_name], representation[field_name] = self.deep_get_or_create(
                     data, field_model
                 )
             elif isinstance(data, list):
                 representation[field_name] = list(data)
                 for index, item in enumerate(data):
                     if isinstance(item, dict):
-                        validated_data[field_name][index], representation[field_name][index] = self._deep_create(
+                        validated_data[field_name][index], representation[field_name][index] = self.deep_get_or_create(
                             item, field_model
                         )
         self.initial_data = validated_data
@@ -131,9 +130,7 @@ class DeepSerializer(serializers.ModelSerializer):
                 class Meta:
                     model = _model
                     depth = 0
-                    fields = '__all__'
-
-            CommonSerializer.Meta.fields = parent.Meta.fields if mode else '__all__'
+                    fields = parent.Meta.fields if mode else '__all__'
 
         return cls._serializers[mode + _model.__name__]
 
