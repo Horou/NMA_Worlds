@@ -37,8 +37,7 @@ class ReadOnlyDeepViewset(ReadOnlyModelViewSet):
         depth = int(params.get("depth", self.depth))
         serializer = self.get_serializer_class()
         serializer.Meta.depth = depth
-        queryset = self.queryset.select_related(*serializer._select_related) if depth > 0 else self.queryset
-        queryset = queryset.prefetch_related(*serializer.get_prefetch_related()) if depth > 1 else queryset
+        queryset = self.queryset.prefetch_related(*serializer.get_prefetch_related()) if depth > 0 else self.queryset
         filter_by = {name: params[name] for name in self._fields if name in params}
         queryset = queryset.filter(**filter_by) if filter_by else queryset
         if order_by := params.get("order_by", None):
