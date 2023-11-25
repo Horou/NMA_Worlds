@@ -1,4 +1,5 @@
 import re
+from pprint import pprint
 
 from django.db.transaction import atomic
 from rest_framework import serializers
@@ -20,20 +21,28 @@ class DeepSerializer(serializers.ModelSerializer):
         if hasattr(cls, "Meta"):
             model = cls.Meta.model
             cls._serializers[cls._mode + model.__name__] = cls
-            cls._nested_models = {
-                field_name: field.related_model
-                for field_name, field in model_meta.get_field_info(model).relations.items()
-                if not field_name.endswith("_set")
-            }
-            cls.Meta.read_only_fields = tuple(model_meta.get_field_info(model).reverse_relations)
+            cls._nested_models = cls.get_nested_models(model)
             cls._prefetch_related = [related[2:] for related in cls.build_prefetch_related(model, [model])]
             cls.parent_prefetch = cls.parent_prefetch if hasattr(cls, 'parent_prefetch') else cls._prefetch_related
+            cls.Meta.read_only_fields = tuple(model_meta.get_field_info(model).reverse_relations)
+
+
+    @classmethod
+    def get_nested_models(cls, model):
+        nested_models = {}
+        for field_name, field in model_meta.get_field_info(model).relations.items():
+            if not field_name.endswith("_set"):
+                nested_models[field_name] = field.related_model
+        for field in model._meta.get_fields():
+            if field.one_to_one:
+                nested_models[field.name] = field.related_model
+        return nested_models
+
 
     @classmethod
     def build_prefetch_related(cls, parent_model, exclude_models):
         prefetch_related = []
-        for field_name, field in model_meta.get_field_info(parent_model).relations.items():
-            model = field.related_model
+        for field_name, model in cls.get_nested_models(parent_model).items():
             if model not in exclude_models:
                 current_prefetch = f"__{field_name}"
                 prefetch_related.append(current_prefetch)
@@ -58,14 +67,13 @@ class DeepSerializer(serializers.ModelSerializer):
                 parent_prefetch.append("__".join(child_prefetch[1:]))
         return parent_prefetch
 
-    def get_nested_fields(self):
-        return [
-            field.split('__')[0]
-            for field in self.parent_prefetch
-        ]
-
     def get_default_field_names(self, declared_fields, model_info):
-        return super().get_default_field_names(declared_fields, model_info) + self.get_nested_fields()
+        return (
+            [model_info.pk.name] +
+            list(declared_fields) +
+            list(model_info.fields) +
+            list(set(field.split('__')[0] for field in self.parent_prefetch))
+        )
 
     def build_nested_field(self, field_name, relation_info, nested_depth):
         serializer = self.get_serializer(relation_info.related_model, mode=f"Read{self.Meta.model.__name__}Nested")
@@ -73,50 +81,57 @@ class DeepSerializer(serializers.ModelSerializer):
         serializer.Meta.depth = nested_depth - 1
         return serializer, get_nested_relation_kwargs(relation_info)
 
-    def deep_list_create(self, data):
-        return [self.deep_create(item)[1] for item in data]
+    def create_nested(self, data):
+        representation = {}
+        for field_name, model in self._nested_models.items():
+            field_data = data.get(field_name, None)
+            if isinstance(field_data, dict):
+                data[field_name], representation[field_name] = self.get_or_create(model, field_data)
+            if isinstance(field_data, list):
+                data[field_name], representation[field_name] = self.get_or_create_many(model, field_data)
+        self.initial_data = data
+        if self.is_valid():
+            return self.save().pk, dict(self.data, **representation)
+        representation["ERROR"] = self.errors
+        return "Fail to serialize %s" % self.Meta.model.__name__, representation
 
-    def deep_create(self, data):
-        result_pk, representation = "", {}
-        try:
-            with atomic():
-                result_pk, representation = self.deep_get_or_create(data, self.Meta.model)
-                if "ERROR" in representation:
-                    raise Exception(representation["ERROR"])
-                representation["pk"] = result_pk
-        except Exception as e:
-            print(e)
-        return result_pk, representation
-
-    def deep_get_or_create(self, data, model):
+    def get_or_create(self, model, data: dict):
         try:
             instance = model.objects.get(pk=data[model._meta.pk.name])
         except:
             instance = None
         return self.get_serializer(model, mode="Nested")(
-            instance, data=data, context=self.context, partial=True if instance else False
-        ).create_child(data)
+            instance, data=data, context=self.context, partial=bool(instance)
+        ).create_nested(data)
 
-    def create_child(self, validated_data):
-        representation = {}
-        for field_name, field_model in self._nested_models.items():
-            data = validated_data.get(field_name, None)
-            if isinstance(data, dict):
-                validated_data[field_name], representation[field_name] = self.deep_get_or_create(
-                    data, field_model
-                )
-            elif isinstance(data, list):
-                representation[field_name] = list(data)
-                for index, item in enumerate(data):
-                    if isinstance(item, dict):
-                        validated_data[field_name][index], representation[field_name][index] = self.deep_get_or_create(
-                            item, field_model
-                        )
-        self.initial_data = validated_data
-        if self.is_valid():
-            return self.save().pk, dict(self.data, **representation)
-        representation["ERROR"] = self.errors
-        return "Fail to serialize %s" % self.Meta.model.__name__, representation
+    def get_or_create_many(self, model, list_data: list):
+        primary_keys, representations = [], []
+        for data in list_data:
+            pk, representation = self.get_or_create(model, data) if isinstance(data, dict) else (data, data)
+            primary_keys.append(pk)
+            representations.append(representation)
+        return primary_keys, representations
+
+    def deep_create(self, data: dict | list):
+        result = None
+        try:
+            with atomic():
+                if isinstance(data, dict):
+                    primary_key, representation = self.get_or_create(self.Meta.model, data)
+                    result = representation
+                    if "ERROR" in representation:
+                        raise Exception(representation['ERROR'])
+                if isinstance(data, list):
+                    primary_keys, representations = self.get_or_create_many(self.Meta.model, data)
+                    result = representations
+                    if any("ERROR" in d for d in representations):
+                        raise Exception([
+                            representation['ERROR'] if 'ERROR' in representation else None
+                            for representation in representations
+                        ])
+        except Exception as e:
+            print(e)
+        return result
 
     @classmethod
     def get_serializer(cls, _model, mode: str = ""):
@@ -137,21 +152,3 @@ class DeepSerializer(serializers.ModelSerializer):
 ########################################################################################################################
 #
 ########################################################################################################################
-
-
-class FilesSerializer(DeepSerializer):
-    file = serializers.FileField()
-    _mode = "Upload"
-
-    @classmethod
-    def get_upload_serializer(cls, _model):
-        if "Upload" + _model.__name__ not in cls._serializers:
-            class UploadSerializer(FilesSerializer):
-                _mode = "Upload"
-
-                class Meta:
-                    model = _model
-                    depth = 0
-                    fields = ['file']
-
-        return cls._serializers["Upload" + _model.__name__]
