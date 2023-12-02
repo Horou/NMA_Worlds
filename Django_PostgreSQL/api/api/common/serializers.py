@@ -1,9 +1,9 @@
-import json
 import re
 from collections import OrderedDict
 
 from django.db.transaction import atomic
 from rest_framework import serializers
+from rest_framework.exceptions import ValidationError
 from rest_framework.utils import model_meta
 from rest_framework.utils.field_mapping import (get_nested_relation_kwargs, )
 
@@ -57,10 +57,10 @@ class DeepSerializer(serializers.ModelSerializer):
 
     def get_default_field_names(self, declared_fields, model_info):
         return (
-            [model_info.pk.name] +
-            list(declared_fields) +
-            list(model_info.fields) +
-            list(set(field.split('__')[0] for field in self.nested_prefetch))
+                [model_info.pk.name] +
+                list(declared_fields) +
+                list(model_info.fields) +
+                list(set(field.split('__')[0] for field in self.nested_prefetch))
         )
 
     def build_nested_field(self, field_name, relation_info, nested_depth):
@@ -69,7 +69,7 @@ class DeepSerializer(serializers.ModelSerializer):
         serializer.Meta.depth = nested_depth - 1
         return serializer, get_nested_relation_kwargs(relation_info)
 
-    def create_deep_dict(self, data: dict) -> tuple[str, dict]:
+    def create_deep_dict(self, data: dict) -> tuple:
         nest = {}
         for field_name, model in self._nested_models.items():
             field_data = data.get(field_name, None)
@@ -82,50 +82,55 @@ class DeepSerializer(serializers.ModelSerializer):
                 )
         return self.get_or_create(data, nest)
 
-    def create_deep_list(self, data_list: list) -> list[tuple[str, dict]]:
-        nests = [{}] * len(data_list)
-        for field, model in self._nested_models.items():
-            serializer = self.get_serializer(model, mode="Nested")(context=self.context)
-            if dicts := [z for z in zip(data_list, nests)
-                         if isinstance(z[0], dict) and isinstance(z[0].get(field, None), dict)]:
-                for (data, nested), (key, rep) in zip(dicts, serializer.create_deep_list([d[field] for d, _ in dicts])):
-                    data[field], nested[field] = key, rep
-            elif lists := [z for z in zip(data_list, nests)
-                           if isinstance(z[0], dict) and isinstance(z[0].get(field, None), list)]:
-                flatten_list = serializer.create_deep_list([data for sublist, _ in lists for data in sublist[field]])
-                for data, nested in lists:
-                    data[field], nested[field] = zip(*flatten_list[:len(data[field])])
-                    flatten_list = flatten_list[len(data[field]):]
-        return self.get_or_create_many(data_list, nests)
-
     def get_or_create(self, data: dict, nested_representation: dict):
-        filter_by = {
-            field: data[field]
-            for sublist in self.Meta.model._meta.unique_together for field in sublist
-            if field in data
-        }
-        filter_by = filter_by if filter_by else {"pk": data.get(self.Meta.model._meta.pk.name, "")}
-        self.instance = self.Meta.model.objects.filter(**filter_by).first()
-        self.partial = True if self.instance else False
+        self.instance = self.Meta.model.objects.filter(pk=data.get(self.Meta.model._meta.pk.name, None)).first()
+        self.partial = bool(self.instance)
         self.initial_data = data
         if self.is_valid():
             result = self.save().pk, OrderedDict(self.data, **nested_representation)
+            del self._data
+            del self._validated_data
         else:
             nested_representation["ERROR"] = self.errors
             result = f"Fail to serialize {self.Meta.model.__name__}", nested_representation
-        del self._data
-        del self._validated_data
         return result
 
-    def get_or_create_many(self, data_list: list, nested_representations: list) -> list[tuple]:
-        keys_to_index, created = {}, []
+    def create_deep_list(self, data_list: list) -> list[tuple]:
+        representations = [{}] * len(data_list)
+        nested = [zipped for zipped in zip(data_list, representations) if isinstance(zipped[0], dict)]
+        for field_name, model in self._nested_models.items():
+            serializer = self.get_serializer(model, mode="Nested")(context=self.context)
+            if dicts := [zipped for zipped in nested if isinstance(zipped[0].get(field_name, None), dict)]:
+                for (d, r), created in zip(dicts, serializer.create_deep_list([d[field_name] for d, _ in dicts])):
+                    d[field_name], r[field_name] = created
+            elif lists := [(d, r, len(d[field_name])) for d, r in nested if isinstance(d.get(field_name, None), list)]:
+                flatten_lists = serializer.create_deep_list([item for d, _, _ in lists for item in d[field_name]])
+                start = 0
+                for data, representation, length in lists:
+                    data[field_name], representation[field_name] = zip(*flatten_lists[start:start+length])
+                    start += length
+        return self.bulk_update_or_create(data_list, representations)
+
+    def bulk_update_or_create(self, data_list: list, nested_representations: list) -> list[tuple]:
+        pk_name = self.Meta.model._meta.pk.name
+        instances = self.Meta.model.objects.in_bulk(set(d[pk_name] for d in data_list if pk_name in d))
+        created_index, created = {}, []
         for index, (data, nested) in enumerate(zip(data_list, nested_representations)):
-            key = json.dumps(data)
-            if key in keys_to_index:
-                created.append(created[keys_to_index[key]])
+            primary_key = data.get(pk_name, None)
+            if primary_key in created_index:
+                created.append(created[created_index[primary_key]])
             else:
-                created.append(self.get_or_create(data, nested))
-                keys_to_index[key] = index
+                self.instance = instances.get(primary_key, None)
+                self.partial = bool(self.instance)
+                self.initial_data = data
+                if self.is_valid():
+                    created.append((self.save().pk, OrderedDict(self.data, **nested)))
+                    del self._data
+                    del self._validated_data
+                else:
+                    nested["ERROR"] = self.errors
+                    created.append((f"Fail to serialize {self.Meta.model.__name__}", nested))
+                created_index[primary_key] = index
         return created
 
     def deep_create(self, data: dict | list):
@@ -136,13 +141,12 @@ class DeepSerializer(serializers.ModelSerializer):
                 if isinstance(data, dict):
                     primary_key, representation = serializer.create_deep_dict(data)
                     if "ERROR" in representation:
-                        raise Exception(representation)
+                        raise ValidationError()
                 if isinstance(data, list):
                     primary_key, representation = zip(*serializer.create_deep_list(data))
-                    if failed := [d for d in representation if "ERROR" in d]:
-                        representation = failed
-                        raise Exception(representation)
-        except Exception as e:
+                    if any("ERROR" in d for d in representation):
+                        raise ValidationError()
+        except ValidationError as e:
             print(f"ERROR: {e}")
         return representation
 
@@ -160,7 +164,6 @@ class DeepSerializer(serializers.ModelSerializer):
                     fields = parent.Meta.fields if mode else '__all__'
 
         return cls._serializers[mode + _model.__name__]
-
 
 ########################################################################################################################
 #
