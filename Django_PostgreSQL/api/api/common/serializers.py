@@ -1,4 +1,3 @@
-import re
 from collections import OrderedDict
 
 from django.db.transaction import atomic
@@ -43,17 +42,17 @@ class DeepSerializer(serializers.ModelSerializer):
         return [
             prefetch_related
             for prefetch_related in cls._prefetch_related
-            if len(re.findall('__', prefetch_related)) < cls.Meta.depth
+            if len(prefetch_related.split('__')) < cls.Meta.depth + 2
         ]
 
     @classmethod
     def get_nested_prefetch(cls, field_name):
-        parent_prefetch = []
+        nested_prefetch = []
         for prefetch in cls.nested_prefetch:
             child_prefetch = prefetch.split('__')
-            if child_prefetch[0] == field_name and 0 < len(child_prefetch) - 1 <= cls.Meta.depth:
-                parent_prefetch.append("__".join(child_prefetch[1:]))
-        return parent_prefetch
+            if 1 < len(child_prefetch) < cls.Meta.depth + 2 and child_prefetch[0] == field_name:
+                nested_prefetch.append("__".join(child_prefetch[1:]))
+        return nested_prefetch
 
     def get_default_field_names(self, declared_fields, model_info):
         return (
@@ -69,76 +68,76 @@ class DeepSerializer(serializers.ModelSerializer):
         serializer.Meta.depth = nested_depth - 1
         return serializer, get_nested_relation_kwargs(relation_info)
 
-    def deep_travel_dict(self, data: dict) -> tuple:
+    def deep_dict_travel(self, data: dict) -> tuple:
         nested = {}
         for field_name, model in self._nested_models.items():
             field_data = data.get(field_name, None)
             serializer = self.get_serializer(model, mode="Nested")(context=self.context)
             if isinstance(field_data, dict):
-                data[field_name], nested[field_name] = serializer.deep_travel_dict(field_data)
+                data[field_name], nested[field_name] = serializer.deep_dict_travel(field_data)
             elif isinstance(field_data, list):
-                data[field_name], nested[field_name] = zip(*serializer.deep_travel_list(field_data))
+                data[field_name], nested[field_name] = map(list, zip(*serializer.deep_list_travel(field_data)))
         return self.update_or_create(data, nested)
 
-    def update_or_create(self, data: dict, nested: dict, instances: dict = None):
-        if pk := data.get(self.Meta.model._meta.pk.name, None):
-            self.instance = instances.get(pk, None) if instances else self.Meta.model.objects.filter(pk=pk).first()
-        self.initial_data, self.partial = data, bool(self.instance)
-        if self.is_valid():
-            return self.save().pk, OrderedDict(self.data, **nested)
-        return f"Failed to serialize", OrderedDict(nested, ERROR=self.errors)
-
-    def create_deep_list(self, data_list: list) -> list[tuple]:
+    def deep_list_travel(self, data_list: list) -> list[tuple]:
         data_and_nested = [(data, {}) for data in data_list]
         datas = [d_n for d_n in data_and_nested if isinstance(d_n[0], dict)]
         for field_name, model in self._nested_models.items():
             serializer = self.get_serializer(model, mode="Nested")(context=self.context)
             if dicts := [zipped for zipped in datas if isinstance(zipped[0].get(field_name, None), dict)]:
-                for (data, rep), created in zip(dicts, serializer.create_deep_list([d[field_name] for d, _ in dicts])):
-                    data[field_name], rep[field_name] = created
+                for (data, rep), res in zip(dicts, serializer.deep_list_travel([d[field_name] for d, _ in dicts])):
+                    data[field_name], rep[field_name] = res
             elif lists := [(d, r, len(d[field_name])) for d, r in datas if isinstance(d.get(field_name, None), list)]:
-                flatten_lists = serializer.create_deep_list([item for d, _, _ in lists for item in d[field_name]])
+                flatten_res = serializer.deep_list_travel([item for d, _, _ in lists for item in d[field_name]])
                 start = 0
                 for data, representation, length in lists:
-                    data[field_name], representation[field_name] = zip(*flatten_lists[start:start+length])
+                    data[field_name], representation[field_name] = map(list, zip(*flatten_res[start:start + length]))
                     start += length
         return self.bulk_update_or_create(data_and_nested)
 
+    def update_or_create(self, data: dict, nested: dict, instances: dict = None):
+        model = self.Meta.model
+        if pk := data.get(model._meta.pk.name, None):
+            self.instance = instances.get(pk, None) if instances is not None else model.objects.filter(pk=pk).first()
+        self.initial_data, self.partial = data, bool(self.instance)
+        if self.is_valid():
+            return self.save().pk, OrderedDict(self.data, **nested)
+        return f"Failed to serialize {model.__name__}", OrderedDict(nested, ERROR=self.errors)
+
     def bulk_update_or_create(self, data_and_nested: list[tuple]) -> list[tuple]:
-        pks_and_representations, created_pk = [], {}
+        pks_and_representations, created = [], {}
         pk_name = self.Meta.model._meta.pk.name
-        instances = self.Meta.model.objects.in_bulk(set(d[pk_name] for d, _ in data_and_nested if pk_name in d))
+        instances = self.Meta.model.objects.prefetch_related(*self.get_prefetch_related()).in_bulk(
+            set(d[pk_name] for d, _ in data_and_nested if pk_name in d)
+        )
         for data, nested in data_and_nested:
             if isinstance(data, dict):
-                primary_key = data.get(pk_name, None)
-                if primary_key in created_pk:
-                    pks_and_representations.append(created_pk[primary_key])
-                else:
-                    result = self.update_or_create(data, nested, instances)
-                    if "Failed to serialize" != result[0]:
+                found_pk = data.get(pk_name, None)
+                if found_pk not in created:
+                    created_pk, representation = self.update_or_create(data, nested, instances=instances)
+                    found_pk = found_pk if found_pk is not None else created_pk
+                    created[found_pk] = (created_pk, representation)
+                    if "ERROR" not in representation:
                         del self._data, self._validated_data
-                    created_pk[primary_key] = created_pk[result[0]] = result
-                    pks_and_representations.append(result)
+                pks_and_representations.append(created[found_pk])
             else:
                 pks_and_representations.append((data, data))
         return pks_and_representations
 
     def deep_create(self, data: dict | list):
-        representation = type(data)()
         try:
             with atomic():
-                serializer = self.get_serializer(self.Meta.model, mode="Nested")(context=self.context, data=data)
+                serializer = self.get_serializer(self.Meta.model, mode="Nested")(context=self.context)
                 if data and isinstance(data, dict):
-                    primary_key, representation = serializer.create_deep_dict(data)
+                    primary_key, representation = serializer.deep_dict_travel(data)
                     if "ERROR" in representation:
                         raise ValidationError(representation)
-                if data and isinstance(data, list):
-                    primary_key, representation = zip(*serializer.create_deep_list(data))
-                    representation = list(representation)
+                elif data and isinstance(data, list):
+                    primary_key, representation = map(list, zip(*serializer.deep_list_travel(data)))
                     if any("ERROR" in d for d in representation):
                         raise ValidationError(representation)
-        except ValidationError as e:
-            print(f"ERROR: {e}")
+        except ValidationError as representation:
+            return representation
         return representation
 
     @classmethod
@@ -146,7 +145,7 @@ class DeepSerializer(serializers.ModelSerializer):
         if mode + _model.__name__ not in cls._serializers:
             parent = cls.get_serializer(_model) if mode else DeepSerializer
 
-            class CommonSerializer(parent):
+            class CommonNestedSerializer(parent):
                 _mode = mode
 
                 class Meta:
