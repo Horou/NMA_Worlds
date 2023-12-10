@@ -18,6 +18,10 @@ class ReadOnlyDeepViewSet(ReadOnlyModelViewSet):
             cls._viewsets[cls._mode + cls.queryset.model.__name__] = cls
             cls._fields = {field.name for field in cls.queryset.model._meta.get_fields()}
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.depth = 0
+
     @classmethod
     def init_router(cls, router, models: list):
         for model in models:
@@ -28,11 +32,9 @@ class ReadOnlyDeepViewSet(ReadOnlyModelViewSet):
 
     def get_queryset(self):
         params = self.request.query_params
-        queryset = self.queryset
         serializer = self.get_serializer_class()
-        serializer.Meta.depth = int(params.get("depth", 0))
-        if serializer.Meta.depth > 0:
-            queryset = queryset.prefetch_related(*serializer.get_prefetch_related())
+        serializer.Meta.depth = int(params.get("depth", self.depth))
+        queryset = self.queryset.prefetch_related(*serializer.get_prefetch_related())
         if filter_by := {name: params[name] for name in self._fields if name in params}:
             queryset = queryset.filter(**filter_by) if filter_by else queryset
         if order_by := params.get("order_by", None):
@@ -50,10 +52,23 @@ class ReadOnlyDeepViewSet(ReadOnlyModelViewSet):
                 depth = 0
 
             CommonViewSet.__name__ = _model.__name__
-            CommonViewSet.__doc__ = f"View Set for the model: '{_model.__name__}' used for {mode if mode else 'Read and Write'}"
+            CommonViewSet.__doc__ = f"""
+            View Set for the model: '{_model.__name__}' used for {mode if mode else 'Read and Write'}
+
+            For GET request:
+            Filtering is made with 'field_name=value'. (example: /?label=foo&name=bar)
+            Sorting is made with 'order_by' like 'order_by=field_name'. (example: /?order_by=foo)
+            Display deeper model with 'depth' like 'depth=depth_level'. (example: /?depth=5)
+            And you can do it all at once. (example: /?depth=10&order_by=foo&label=bar&group=bar)
+            """
 
         return cls._viewsets[mode + _model.__name__]
 
 
 class DeepViewSet(ReadOnlyDeepViewSet, ModelViewSet):
     _mode = ""
+
+
+########################################################################################################################
+#
+########################################################################################################################
