@@ -1,3 +1,4 @@
+import json
 from collections import OrderedDict
 
 from django.db.transaction import atomic
@@ -21,28 +22,38 @@ class DeepSerializer(serializers.ModelSerializer):
         if hasattr(cls, "Meta"):
             model = cls.Meta.model
             cls._serializers[cls._mode + model.__name__] = cls
-            cls._nested_models = {f.name: f.related_model for f in model._meta.get_fields() if f.related_model}
+            cls._nested_models = cls.build_nested_models(model)
             cls._prefetch_related = [p[2:] for p in cls.build_prefetch_related(model, [model])]
-            cls.nested_prefetch = cls.nested_prefetch if hasattr(cls, 'nested_prefetch') else cls._prefetch_related
+            cls.nested_prefetch = cls._prefetch_related
             cls.Meta.read_only_fields = tuple(model_meta.get_field_info(model).reverse_relations)
+
+    @classmethod
+    def build_nested_models(cls, model):
+        exclude_set = {name for name in model_meta.get_field_info(model).reverse_relations if name.endswith("_set")}
+        return {
+            field_relation.name: field_relation.related_model
+            for field_relation in model._meta.get_fields()
+            if field_relation.related_model and f"{field_relation.name}_set" not in exclude_set
+        }
 
     @classmethod
     def build_prefetch_related(cls, parent_model, exclude_models):
         prefetch_related = []
-        for field in parent_model._meta.get_fields():
-            if (model := field.related_model) and model not in exclude_models:
-                current_prefetch = f"__{field.name}"
+        for field_name, model in cls.build_nested_models(parent_model).items():
+            if model not in exclude_models:
+                current_prefetch = f"__{field_name}"
                 prefetch_related.append(current_prefetch)
                 for prefetch in cls.build_prefetch_related(model, exclude_models + [model]):
                     prefetch_related.append(current_prefetch + prefetch)
         return prefetch_related
 
     @classmethod
-    def get_prefetch_related(cls):
+    def get_prefetch_related(cls, excludes: list[str] = []):
         return [
             prefetch_related
             for prefetch_related in cls._prefetch_related
             if len(prefetch_related.split('__')) < cls.Meta.depth + 2
+               and not any(prefetch_related.startswith(exclude) for exclude in excludes if exclude)
         ]
 
     @classmethod
@@ -80,20 +91,21 @@ class DeepSerializer(serializers.ModelSerializer):
         return self.update_or_create(data, nested)
 
     def deep_list_travel(self, data_list: list) -> list[tuple]:
-        data_and_nested = [(data, {}) for data in data_list]
-        datas = [d_n for d_n in data_and_nested if isinstance(d_n[0], dict)]
+        data_and_nested_list = [(data, {}) for data in data_list]
+        to_create = [d_n for d_n in data_and_nested_list if isinstance(d_n[0], dict)]
         for field_name, model in self._nested_models.items():
             serializer = self.get_serializer(model, mode="Nested")(context=self.context)
-            if dicts := [zipped for zipped in datas if isinstance(zipped[0].get(field_name, None), dict)]:
-                for (data, rep), res in zip(dicts, serializer.deep_list_travel([d[field_name] for d, _ in dicts])):
-                    data[field_name], rep[field_name] = res
-            elif lists := [(d, r, len(d[field_name])) for d, r in datas if isinstance(d.get(field_name, None), list)]:
-                flatten_res = serializer.deep_list_travel([item for d, _, _ in lists for item in d[field_name]])
+            if dicts := [d_n for d_n in to_create if isinstance(d_n[0].get(field_name, None), dict)]:
+                for (data, rep), result in zip(dicts, serializer.deep_list_travel([d[field_name] for d, _ in dicts])):
+                    data[field_name], rep[field_name] = result
+            elif lists := [d_n for d_n in to_create if isinstance(d_n[0].get(field_name, None), list)]:
+                flatten_result = serializer.deep_list_travel([i for d, _ in lists for i in d[field_name]])
                 start = 0
-                for data, representation, length in lists:
-                    data[field_name], representation[field_name] = map(list, zip(*flatten_res[start:start + length]))
-                    start += length
-        return self.bulk_update_or_create(data_and_nested)
+                for data, nested in lists:
+                    if length := len(data[field_name]):
+                        data[field_name], nested[field_name] = map(list, zip(*flatten_result[start:start + length]))
+                        start += length
+        return self.bulk_update_or_create(data_and_nested_list)
 
     def update_or_create(self, data: dict, nested: dict, instances: dict = None):
         model = self.Meta.model
@@ -107,9 +119,8 @@ class DeepSerializer(serializers.ModelSerializer):
     def bulk_update_or_create(self, data_and_nested: list[tuple]) -> list[tuple]:
         pks_and_representations, created = [], {}
         pk_name = self.Meta.model._meta.pk.name
-        instances = self.Meta.model.objects.prefetch_related(*self.get_prefetch_related()).in_bulk(
-            set(d[pk_name] for d, _ in data_and_nested if pk_name in d)
-        )
+        found_pks = set(d[pk_name] for d, _ in data_and_nested if pk_name in d)
+        instances = self.Meta.model.objects.prefetch_related(*self.get_prefetch_related()).in_bulk(found_pks)
         for data, nested in data_and_nested:
             if isinstance(data, dict):
                 found_pk = data.get(pk_name, None)
@@ -117,6 +128,7 @@ class DeepSerializer(serializers.ModelSerializer):
                     created_pk, representation = self.update_or_create(data, nested, instances=instances)
                     found_pk = found_pk if found_pk is not None else created_pk
                     created[found_pk] = (created_pk, representation)
+                    self.instance = None
                     if "ERROR" not in representation:
                         del self._data, self._validated_data
                 pks_and_representations.append(created[found_pk])
@@ -125,6 +137,7 @@ class DeepSerializer(serializers.ModelSerializer):
         return pks_and_representations
 
     def deep_create(self, data: dict | list):
+        representation = type(data)()
         try:
             with atomic():
                 serializer = self.get_serializer(self.Meta.model, mode="Nested")(context=self.context)
@@ -134,10 +147,10 @@ class DeepSerializer(serializers.ModelSerializer):
                         raise ValidationError(representation)
                 elif data and isinstance(data, list):
                     primary_key, representation = map(list, zip(*serializer.deep_list_travel(data)))
-                    if any("ERROR" in d for d in representation):
-                        raise ValidationError(representation)
-        except ValidationError as representation:
-            return representation
+                    if errors := [d for d in representation if "ERROR" in d]:
+                        raise ValidationError(errors)
+        except ValidationError as e:
+            return e.detail
         return representation
 
     @classmethod
@@ -145,7 +158,7 @@ class DeepSerializer(serializers.ModelSerializer):
         if mode + _model.__name__ not in cls._serializers:
             parent = cls.get_serializer(_model) if mode else DeepSerializer
 
-            class CommonNestedSerializer(parent):
+            class CommonSerializer(parent):
                 _mode = mode
 
                 class Meta:
@@ -154,6 +167,7 @@ class DeepSerializer(serializers.ModelSerializer):
                     fields = parent.Meta.fields if mode else '__all__'
 
         return cls._serializers[mode + _model.__name__]
+
 
 ########################################################################################################################
 #
