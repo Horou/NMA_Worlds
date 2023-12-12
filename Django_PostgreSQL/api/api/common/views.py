@@ -1,3 +1,4 @@
+from rest_framework.utils import model_meta
 from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet
 
 from .serializers import DeepSerializer
@@ -15,12 +16,27 @@ class ReadOnlyDeepViewSet(ReadOnlyModelViewSet):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if cls.queryset:
-            cls._viewsets[cls._mode + cls.queryset.model.__name__] = cls
+            model = cls.queryset.model
+            cls._viewsets[cls._mode + model.__name__] = cls
+            cls._filter_fields = [p[2:] for p in cls.build_filter_fields(model, [model])]
             cls._fields = {field.name for field in cls.queryset.model._meta.get_fields()}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.depth = 0
+
+    @classmethod
+    def build_filter_fields(cls, parent_model, exclude_models):
+        exclude_set = {n for n in model_meta.get_field_info(parent_model).reverse_relations if n.endswith("_set")}
+        prefetch_related = []
+        for field_relation in parent_model._meta.get_fields():
+            if f"{field_relation.name}_set" not in exclude_set:
+                current_prefetch = f"__{field_relation.name}"
+                prefetch_related.append(current_prefetch)
+                if (model := field_relation.related_model) and model not in exclude_models:
+                    for prefetch in cls.build_filter_fields(model, exclude_models + [model]):
+                        prefetch_related.append(current_prefetch + prefetch)
+        return prefetch_related
 
     @classmethod
     def init_router(cls, router, models: list):
@@ -34,8 +50,9 @@ class ReadOnlyDeepViewSet(ReadOnlyModelViewSet):
         params = self.request.query_params
         serializer = self.get_serializer_class()
         serializer.Meta.depth = int(params.get("depth", self.depth))
-        queryset = self.queryset.prefetch_related(*serializer.get_prefetch_related())
-        if filter_by := {name: params[name] for name in self._fields if name in params}:
+        serializer.nested_prefetch = serializer.get_prefetch_related(excludes=params.get("exclude", "").split(","))
+        queryset = self.queryset.prefetch_related(*serializer.nested_prefetch)
+        if filter_by := {field_name: params[field_name] for field_name in self._filter_fields if field_name in params}:
             queryset = queryset.filter(**filter_by) if filter_by else queryset
         if order_by := params.get("order_by", None):
             list_order_by = order_by if isinstance(order_by, list) else [order_by]
@@ -57,8 +74,11 @@ class ReadOnlyDeepViewSet(ReadOnlyModelViewSet):
 
             For GET request:
             Filtering is made with 'field_name=value'. (example: /?label=foo&name=bar)
+            Filter by nested model field with 'field_name__field_name=value'. (example: /?foo__id=bar)
             Sorting is made with 'order_by' like 'order_by=field_name'. (example: /?order_by=foo)
             Display deeper model with 'depth' like 'depth=depth_level'. (example: /?depth=5)
+            Remove deeper model with 'exclude' like 'exclude=foo' or 'exclude=foo,bar'
+            Exclude nested model of nested model like 'exclude=bar__foo,bar__user__group,bar__user__comments'
             And you can do it all at once. (example: /?depth=10&order_by=foo&label=bar&group=bar)
             """
 
